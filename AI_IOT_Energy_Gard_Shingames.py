@@ -1,54 +1,149 @@
 import serial
 import numpy as np
 from sklearn.linear_model import SGDRegressor
-from collections import deque
-import joblib
-import os
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+import time
+import matplotlib.pyplot as plt
+from sklearn.exceptions import NotFittedError
 
-# Initialize the online learning model
-model = SGDRegressor(learning_rate='constant', eta0=0.01)  # Adjust learning rate as needed
-
-# Sliding window to store the last 60 sensor values
-window_size = 60
-sensor_window = deque(maxlen=window_size)
+# Initialize models for each room and the house
+def initialize_models():
+    """Initialize SGD models for rooms and the house."""
+    room_models = [make_pipeline(StandardScaler(), SGDRegressor(learning_rate='constant', eta0=0.0001)) for _ in range(4)]
+    house_model = make_pipeline(StandardScaler(), SGDRegressor(learning_rate='constant', eta0=0.0001))
+    return room_models, house_model
 
 # Configure serial connection
-ser = serial.Serial('/dev/ttyS0', 115200, timeout=1)  # Use '/dev/ttyAMA0' or '/dev/serial0' if needed
+def configure_serial(port='/dev/ttyUSB0', baud_rate=115200):
+    """Configure and return a serial connection."""
+    try:
+        ser = serial.Serial(port, baud_rate, timeout=1)
+        print(f"Serial connection established on {port}.")
+        return ser
+    except serial.SerialException as e:
+        print(f"Error opening serial port: {e}")
+        return None
 
-print("Waiting for sensor data...")
+# Update models incrementally
+def update_models(sensor_values, room_models, house_model):
+    """Update room and house models with new sensor data."""
+    sensor_array = np.array(sensor_values).reshape(1, -1)  # Shape (1, 4)
+    
+    for i in range(4):
+        X_room = np.array([[sensor_values[i]]])  # Single feature input
+        target_room = sensor_values[i]  # Predict itself for now
+        
+        # Fit StandardScaler before first training iteration
+        if not hasattr(room_models[i].named_steps['sgdregressor'], 'coef_'):
+            room_models[i].named_steps['standardscaler'].fit(X_room)
+        
+        room_models[i].named_steps['sgdregressor'].partial_fit(X_room, [target_room])
 
-while True:
-    if ser.in_waiting > 0:
-        # Read sensor data from ESP32
-        data = ser.readline().decode('utf-8').strip()
-        try:
-            sensor_value = int(data)  # Convert data to integer
-            print(f"Sensor Reading: {sensor_value}")
+    target_house = np.mean(sensor_values)  # Predict the average of all rooms
+    
+    if not hasattr(house_model.named_steps['sgdregressor'], 'coef_'):
+        house_model.named_steps['standardscaler'].fit(sensor_array)
+    
+    house_model.named_steps['sgdregressor'].partial_fit(sensor_array, [target_house])
 
-            # Add the new sensor value to the window
-            sensor_window.append(sensor_value)
+# Predict values for next day, week, and month
+def predict_values(house_model, sensor_values):
+    """Predict values for next day, week, and month."""
+    X_house = np.array(sensor_values).reshape(1, -1)  # Shape (1, 4)
+    try:
+        house_prediction = house_model.predict(X_house)
+        next_day_prediction = house_prediction[0] * 1.1 * 12 * 24 # Prediction for next day
+        next_week_prediction = house_prediction[0] * 1.5 * 12 * 24 * 7  # Prediction for next week
+        next_month_prediction = house_prediction[0] * 2.0 * 12 * 24 * 30 # Prediction for next month
+        return next_day_prediction, next_week_prediction, next_month_prediction
+    except NotFittedError:
+        print("House model not yet trained.")
+        return None, None, None
 
-            # Check if the window has 60 values
-            if len(sensor_window) == window_size:
-                # Convert the window to a numpy array for prediction
-                X = np.array(sensor_window).reshape(1, -1)  # Reshape for model input
+# Main loop for continuous prediction
+def main():
+    room_models, house_model = initialize_models()
+    ser = configure_serial()
+    
+    if not ser:
+        return  # Exit if serial connection fails
+    
+    print("Waiting for 'A' from ESP32 to start receiving sensor data...")
+    while True:
+        if ser.in_waiting > 0:
+            data = ser.readline().decode('utf-8').strip()
+            if data == 'A':
+                print("Received 'A', starting data collection...")
+                break
 
-                # Make prediction
-                prediction = model.predict(X)
-                print(f"Prediction: {prediction[0]}")
+    ser.reset_input_buffer()
+    time.sleep(1)
+        
+    # Initialize plot
+    plt.ion()
+    fig, ax = plt.subplots()
+    lines = ax.plot([], [], [], [], [], [])
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Predicted Values")
+    ax.legend(["Next Day", "Next Week", "Next Month"])
+    
+    # Data storage for visualization
+    prediction_history_size = 100
+    next_day_predictions = []
+    next_week_predictions = []
+    next_month_predictions = []
+        
+    try:
+        while True:
+            if ser.in_waiting > 0:
+                data = ser.readline().decode('utf-8').strip()
+                
+                if "Connecting to" in data or "Next Day" in data or "Predicted values" in data:
+                    continue
+                
+                try:
+                    sensor_values = list(map(float, data.split(',')))  # Change int to float
+                    if len(sensor_values) != 4:
+                        print(f"Invalid data format: {data}")
+                        continue
 
-                # Update the model with the new data point
-                # For now, assume the target value is the average of the window (replace with your logic)
-                target_value = np.mean(sensor_window)
-                model.partial_fit(X, [target_value])
+                    update_models(sensor_values, room_models, house_model)
+                    next_day, next_week, next_month = predict_values(house_model, sensor_values)
 
-                # Save the model to the desktop
-                desktop_path = os.path.join(os.path.expanduser('~'), 'Desktop')
-                model_filename = os.path.join(desktop_path, 'sliding_window_model.pkl')
-                joblib.dump(model, model_filename)
-                print(f"Model saved to: {model_filename}")
+                    if next_day is not None:
+                        next_day_predictions.append(next_day)
+                        next_week_predictions.append(next_week)
+                        next_month_predictions.append(next_month)
+                        
+                        if len(next_day_predictions) > prediction_history_size:
+                            next_day_predictions.pop(0)
+                            next_week_predictions.pop(0)
+                            next_month_predictions.pop(0)
+                        
+                        print(f"Predicted values - Next Day: {next_day:.2f}, Next Week: {next_week:.2f}, Next Month: {next_month:.2f}")
+                        
+                        # Update plot
+                        lines[0].set_data(range(len(next_day_predictions)), next_day_predictions)
+                        lines[1].set_data(range(len(next_week_predictions)), next_week_predictions)
+                        lines[2].set_data(range(len(next_month_predictions)), next_month_predictions)
+                        ax.relim()
+                        ax.autoscale_view()
+                        plt.draw()
+                        plt.pause(0.01)
+                        
+                        # Send predicted values back to ESP32
+                        predicted_values = f"{next_day:.2f},{next_week:.2f},{next_month:.2f}"
+                        ser.write((predicted_values + "\n").encode('utf-8'))
+                        print("Predicted values sent to ESP32:", predicted_values)
+                    
+                except ValueError as e:
+                    print(f"Error processing data: {e}. Data: {data}")
+            
+            time.sleep(0.1)
+    
+    except KeyboardInterrupt:
+        print("Program terminated by user.")
 
-                # Send prediction back to ESP32 (optional)
-                ser.write(f"{prediction[0]}\n".encode('utf-8'))
-        except ValueError:
-            print("Invalid data received")
+if name == "__main__":
+    main()
