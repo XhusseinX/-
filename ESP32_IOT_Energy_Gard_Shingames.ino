@@ -1,120 +1,115 @@
-#define BLYNK_TEMPLATE_ID "TMPL4rmwiLFqh"  // معرف القالب المستخدم في Blynk
-#define BLYNK_TEMPLATE_NAME "IoT Energy Guard"  // اسم القالب في Blynk
-#define BLYNK_AUTH_TOKEN "gBtkOsEL-vg-gi3pJNl168LDgj0GM068"  // رمز المصادقة لمنصة Blynk
-#define BLYNK_PRINT Serial  // تمكين طباعة البيانات في شاشة السيريال لمراقبة الكود
+#define BLYNK_TEMPLATE_ID "TMPL4rmwiLFqh"
+#define BLYNK_TEMPLATE_NAME "IoT Energy Guard"
+#define BLYNK_AUTH_TOKEN "gBtkOsEL-vg-gi3pJNl168LDgj0GM068"
+#define BLYNK_PRINT Serial
 
-#include <WiFi.h>  // مكتبة الاتصال بشبكة الواي فاي باستخدام ESP32
-#include <WiFiClient.h>  // مكتبة الاتصال بالعملاء على الشبكة
-#include <BlynkSimpleEsp32.h>  // مكتبة Blynk الخاصة بـ ESP32
-#include "ACS712.h"  // مكتبة حساس التيار ACS712 لقياس التيار المتردد (AC)
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
 
-// بيانات الاتصال بشبكة الواي فاي
-char auth[] = BLYNK_AUTH_TOKEN;  // رمز المصادقة الخاص بمنصة Blynk
-char ssid[] = "NCD";  // اسم شبكة الواي فاي
-char pass[] = "N123456n";  // كلمة مرور شبكة الواي فاي
+// WiFi Credentials
+char auth[] = BLYNK_AUTH_TOKEN;
+char ssid[] = "NCD";
+char pass[] = "N123456n";
 
-// تحديد الأرجل المتصلة بالمفاتيح للتحكم بالأجهزة
-const int switchPins[] = {13, 2, 5, 12};  // الأرجل المتصلة بالمفاتيح
-const int switchPin4 = 4;  // مفتاح التحكم في بدء الطباعة
-const int irPin = 25;  // حساس الأشعة تحت الحمراء للكشف عن وجود الأشخاص
+// Pins for switches and ACS712 sensors
+const int switchPins[] = { 13, 2, 5, 12 };  // GPIO pins connected to switches
+const int sensorPins[] = {34, 35, 32, 39}; // Analog input pins for ACS712
+const int switchPin4 = 4;                   // Pin for toggle switch
+const int irPin = 25;                       // Pin for IR sensor
 
-// تعريف الحساسات لقياس التيار المتردد (AC) على المنافذ التناظرية
-ACS712 currentSensors[] = {
-    ACS712(34, 5.0, 1023, 30),  
-    ACS712(35, 5.0, 1023, 30),
-    ACS712(32, 5.0, 1023, 30),
-    ACS712(39, 5.0, 1023, 30)
-    };
+// Virtual pins for Blynk
+const int gaugePins[] = {V0, V2, V5, V12};
+const int statusPin = V1;             // Virtual pin for IR sensor status
+const int totalConsumptionPin = V20;  // Virtual pin for total consumption
+const int nextDayPin = V30;
+const int nextWeekPin = V31;
+const int nextMonthPin = V32;
 
-// المنافذ الافتراضية لعرض البيانات على Blynk
-const int gaugePins[] = {V0, V2, V5, V12};  // كل حساس لديه منفذ خاص على Blynk لعرض قيم التيار
-const int statusPin = V1;  // منفذ حالة وجود الأشخاص في الغرفة (حساس IR)
-const int totalConsumptionPin = V20;  // منفذ عرض الاستهلاك الكلي للطاقة على Blynk
-const int predictionPin = V21;  // منفذ استقبال التنبؤات من Raspberry Pi
+// ACS712 parameters
+const float sensitivity = 0.185; // Sensitivity for 5A module (adjust based on your ACS712 model)
+const int adcMax = 4095;         // ESP32 ADC resolution
+const float vRef = 3.3;          // ESP32 ADC reference voltage
+const float offset = vRef / 2;   // Midpoint voltage
 
-// متغيرات التحكم في جمع البيانات
-bool startPrintingData = false;  // لتحديد ما إذا كان يجب جمع البيانات
-bool sentA = false;  // للتبديل بين الحالة "A" عند الضغط على المفتاح
-bool lastSwitchState = HIGH;  // لتتبع حالة المفتاح في الدورة السابقة
+// Flags
+bool startPrintingData = false;
+bool sentA = false;
+bool lastSwitchState = HIGH;  // To track previous switch state
+
+// Function to read current from ACS712 sensor
+float readCurrent(int pin) {
+  float voltage = (analogRead(pin) * vRef) / adcMax; // Convert ADC reading to voltage
+  float current = (voltage - offset) / sensitivity;  // Convert voltage to current using sensitivity
+  return abs(current); // Return absolute value to avoid negative readings
+}
 
 void setup() {
-    Serial.begin(115200);  // بدء الاتصال التسلسلي بسرعة 115200 لعرض البيانات
-    Blynk.begin(auth, ssid, pass, "blynk.cloud", 80);  // بدء الاتصال مع منصة Blynk
-    delay(1000);  // تأخير بسيط لضمان الاتصال
+  Serial.begin(115200);
+  Blynk.begin(auth, ssid, pass, "blynk.cloud", 80);
+  delay(1000);
 
-    // إعداد المفاتيح كمدخلات مع مقاومة سحب عالية (INPUT_PULLUP)
-    for (int i = 0; i < 4; i++) {
-        pinMode(switchPins[i], INPUT_PULLUP);
-    }
-    pinMode(switchPin4, INPUT_PULLUP);  // مفتاح التحكم في الطباعة
-    pinMode(irPin, INPUT);  // حساس الأشعة تحت الحمراء
-
-    // تهيئة حساسات التيار
-    for (int i = 0; i < 4; i++) {
-        currentSensors[i].autoMidPoint();  // حساب نقطة المنتصف تلقائيًا لكل حساس
-    }
+  // Set up switch pins as inputs
+  for (int i = 0; i < 4; i++) {
+    pinMode(switchPins[i], INPUT_PULLUP);
+  }
+  pinMode(switchPin4, INPUT_PULLUP);
+  pinMode(irPin, INPUT);
 }
 
 void loop() {
-    Blynk.run();  // تنفيذ التفاعل مع منصة Blynk
+  Blynk.run();
 
-    // التحقق من حالة المفتاح الرابع (الذي يتحكم في بدء جمع البيانات)
-    int switchState = digitalRead(switchPin4);  // قراءة حالة المفتاح
-    if (switchState == LOW && lastSwitchState == HIGH) {  // التبديل بين حالتين عند الضغط
-        sentA = !sentA;  // تبديل حالة "A"
-        startPrintingData = !startPrintingData;  // بدء أو إيقاف جمع البيانات
-        Serial.println("A");  // طباعة "A" في شاشة السيريال
-        delay(300);  // تأخير لمنع التبديل السريع
-    }
-    lastSwitchState = switchState;  // حفظ الحالة الحالية للمفتاح
+  int switchState = digitalRead(switchPin4);
+  if (switchState == LOW && lastSwitchState == HIGH) {
+    sentA = !sentA;
+    startPrintingData = !startPrintingData;
+    Serial.println("A");
+    delay(300);
+  }
+  lastSwitchState = switchState;
 
-    // إذا كان يجب جمع البيانات، نبدأ في قراءة الحساسات
-    if (startPrintingData) {
-        // قراءة حالة حساس الأشعة تحت الحمراء (IR) للكشف عن وجود شخص في الغرفة
-        int irState = digitalRead(irPin);  // إذا كان هناك شخص في الغرفة
-        Blynk.virtualWrite(statusPin, irState == HIGH ? "There is someone in the room" : "No one in the room");
+  if (startPrintingData) {
+    int irState = digitalRead(irPin);
+    Blynk.virtualWrite(statusPin, irState == LOW ? "There is someone " : " empty room ");
 
-        // المتغير الخاص بتخزين قيم التيار من الحساسات للطباعة على شاشة السيريال
-        String valuesToPrint = "";
+    float totalConsumption = 0.0;
+    String valuesToPrint = "";
 
-        // المتغير الخاص بحساب الاستهلاك الكلي للطاقة
-        double totalConsumption = 0.0;
+    for (int i = 0; i < 4; i++) {
+      float current = readCurrent(sensorPins[i]);
+      float power = current * 220.0; // Assume 220V for power calculation
 
-        // قراءة البيانات من جميع الحساسات
-        for (int i = 0; i < 4; i++) {
-            int switchState = digitalRead(switchPins[i]);  // قراءة حالة المفتاح المتصل بالحساس
-            double current = (switchState == HIGH) ? currentSensors[i].getCurrentAC() : 0.0;  // قراءة قيمة التيار إذا كان المفتاح في حالة تشغيل
-
-            Blynk.virtualWrite(gaugePins[i], current);  // إرسال قيمة التيار إلى Blynk
-            totalConsumption += current;  // إضافة القيمة إلى الاستهلاك الكلي للطاقة
-
-            valuesToPrint += String(current, 3) + ",";  // إضافة القيم إلى السلسلة لتتم طباعتها
-        }
-
-        // إرسال الاستهلاك الكلي إلى Blynk فقط (دون طباعته على السيريال)
-        Blynk.virtualWrite(totalConsumptionPin, totalConsumption);
-
-        // إزالة الفاصلة الزائدة في النهاية للطباعة بشكل صحيح
-        valuesToPrint.remove(valuesToPrint.length() - 1);
-        Serial.println(valuesToPrint);  // طباعة قيم التيار فقط على شاشة السيريال
-
-        delay(1000);  // تأخير بسيط بين القراءات
+      // Send the calculated power consumption to Blynk for each device
+      // This represents the real-time power consumption of the device connected to each ACS712 sensor
+      Blynk.virtualWrite(gaugePins[i], power);
+      valuesToPrint += String(power, 3) + ",";
+      totalConsumption += power;
     }
 
-    // استقبال بيانات التنبؤات من Raspberry Pi عبر السيريال
+    Blynk.virtualWrite(totalConsumptionPin, totalConsumption);
+    Serial.print("Total Consumption: ");
+    Serial.println(totalConsumption, 3);
+
+    valuesToPrint.remove(valuesToPrint.length() - 1);
+    Serial.println(valuesToPrint);
+
     if (Serial.available()) {
-          String receivedData = Serial.readStringUntil('\n');
-          receivedData.trim();
-          int firstComma = receivedData.indexOf(',');
-          int secondComma = receivedData.indexOf(',', firstComma + 1);
-          
-          if (firstComma != -1 && secondComma != -1) {
-            double nextDay = receivedData.substring(0, firstComma).toFloat();
-            double nextWeek = receivedData.substring(firstComma + 1, secondComma).toFloat();
-            double nextMonth = receivedData.substring(secondComma + 1).toFloat();
-            
-            Blynk.virtualWrite(nextDayPin, nextDay);
-            Blynk.virtualWrite(nextWeekPin, nextWeek);
-            Blynk.virtualWrite(nextMonthPin, nextMonth);
-          }
+      String receivedData = Serial.readStringUntil('\n');
+      receivedData.trim();
+      int firstComma = receivedData.indexOf(',');
+      int secondComma = receivedData.indexOf(',', firstComma + 1);
+
+      if (firstComma != -1 && secondComma != -1) {
+        double nextDay = receivedData.substring(0, firstComma).toFloat();
+        double nextWeek = receivedData.substring(firstComma + 1, secondComma).toFloat();
+        double nextMonth = receivedData.substring(secondComma + 1).toFloat();
+
+        Blynk.virtualWrite(nextDayPin, nextDay);
+        Blynk.virtualWrite(nextWeekPin, nextWeek);
+        Blynk.virtualWrite(nextMonthPin, nextMonth);
+      }
+    }
+    delay(1000);
+  }
 }
